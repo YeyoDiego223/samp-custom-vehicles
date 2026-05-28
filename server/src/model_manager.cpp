@@ -8,8 +8,7 @@ int ModelManager::registerModel(const std::string& name,
     if (nextId_ > CUSTOM_MODEL_MAX)
         return -1;
 
-    if (!std::filesystem::exists(dffPath) || !std::filesystem::exists(txdPath))
-        return -1;
+    // Los archivos DFF/TXD son del cliente, no del servidor — no verificar existencia
 
     int id = nextId_++;
     models_[id] = { id, name, dffPath, txdPath };
