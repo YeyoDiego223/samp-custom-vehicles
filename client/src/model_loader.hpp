@@ -5,15 +5,18 @@ namespace ModelLoader {
 
 // Registra todos los modelos definidos en custom_vehicles.ini.
 // Llamar solo despues de que GTA SA haya inicializado su sistema de modelos.
+// Fase 1 (DllMain, antes de que GTA SA abra gta3.img):
+// lee cv_orig.ini y parchea gta3.img si hay info de streaming guardada.
+void earlyPatch();
+
+// Fase 2 (InitThread, despues del streaming):
+// lee streaming table para modelos nuevos, actualiza tabla en memoria.
 void init();
 
-// Aplica patches de null-check en 0x4C4BC0 y 0x4C48D0 inmediatamente.
-// Llamar desde DllMain antes de que SA-MP intente cargar modelos custom.
+// Aplica patches de null-check en DllMain (antes de SA-MP).
 void applyPatches();
 
-// Restaura vtable[1] y vtable[2] de CVehicleModelInfo a sus valores originales
-// del binario de GTA SA, deshaciendo los patches de SA-MP que retornan null.
-// Llamar despues de que la tabla de modelos este inicializada.
+// Restaura vtable[1/2] al original del binario de GTA SA.
 void restoreVtable();
 
 // Registra un modelo custom en la tabla de GTA SA.

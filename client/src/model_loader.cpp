@@ -5,6 +5,9 @@
 #include <sstream>
 #include <cstring>
 #include <cstdlib>
+#include <map>
+#include <vector>
+#include <algorithm>
 
 // ID del vehiculo base cuyo model info clonamos (Landstalker, siempre valido)
 static constexpr int BASE_VEHICLE_ID = 400;
@@ -354,10 +357,339 @@ bool ModelLoader::registerModel(int modelId, const std::string& dffPath, const s
     return true;
 }
 
+// ============================================================
+// Sistema dinamico de reemplazo de modelos via gta3.img
+// ============================================================
+
+static constexpr uintptr_t MS_AINFO  = 0x8E4CC0;  // ms_aInfoForModel
+static constexpr uint32_t  SECTOR_SZ = 2048;
+
+struct PatchEntry { uint32_t cdPosn, cdSize; };
+
+static std::string getTempDir() {
+    char t[MAX_PATH]; GetTempPathA(MAX_PATH, t); return std::string(t);
+}
+static std::string getPatchStatePath() { return getTempDir() + "custom_vehicles_patch.ini"; }
+static std::string getOrigInfoPath()   { return getTempDir() + "custom_vehicles_orig.ini";  }
+
+// Carga {modelId: origCdPosn} de cv_orig.ini
+static std::map<int,uint32_t> loadOrigInfo() {
+    std::map<int,uint32_t> s;
+    std::ifstream f(getOrigInfoPath());
+    if (!f.is_open()) return s;
+    std::string line; bool in = false;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0]==';') continue;
+        if (line == "[streaming_info]") { in = true; continue; }
+        if (line[0]=='[') { in = false; continue; }
+        if (!in) continue;
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        s[std::stoi(line.substr(0,eq))] = (uint32_t)std::stoul(line.substr(eq+1));
+    }
+    return s;
+}
+
+static void saveOrigInfo(const std::map<int,uint32_t>& s) {
+    std::ofstream f(getOrigInfoPath());
+    if (!f.is_open()) return;
+    f << "; Auto-generado - no editar\n[streaming_info]\n";
+    for (auto& kv : s) f << kv.first << "=" << kv.second << "\n";
+}
+
+static std::map<int, PatchEntry> loadPatchState() {
+    std::map<int, PatchEntry> s;
+    std::ifstream f(getPatchStatePath());
+    if (!f.is_open()) return s;
+    std::string line; bool inSect = false;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == ';') continue;
+        if (line == "[patch_state]") { inSect = true; continue; }
+        if (line[0] == '[') { inSect = false; continue; }
+        if (!inSect) continue;
+        auto eq = line.find('='), cm = line.find(',');
+        if (eq == std::string::npos || cm == std::string::npos) continue;
+        int id = std::stoi(line.substr(0, eq));
+        s[id] = { (uint32_t)std::stoul(line.substr(eq+1, cm-eq-1)),
+                  (uint32_t)std::stoul(line.substr(cm+1)) };
+    }
+    return s;
+}
+
+static void savePatchState(const std::map<int, PatchEntry>& s) {
+    std::ofstream f(getPatchStatePath());
+    if (!f.is_open()) return;
+    f << "; Generado por custom_vehicles.asi - NO editar manualmente\n[patch_state]\n";
+    for (auto& kv : s)
+        f << kv.first << "=" << kv.second.cdPosn << "," << kv.second.cdSize << "\n";
+}
+
+// Helpers con __try aislado (sin objetos C++ para evitar error C2712)
+static bool readStreamingEntry(int modelId, uint32_t* cdPosn, uint32_t* cdSize) {
+    const uint8_t* e = reinterpret_cast<const uint8_t*>(MS_AINFO + modelId * 20);
+    __try {
+        *cdPosn = *reinterpret_cast<const uint32_t*>(e + 8);
+        *cdSize = *reinterpret_cast<const uint32_t*>(e + 12);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static bool updateStreamingEntry(int modelId, uint32_t cdPosn, uint32_t cdSize) {
+    uint8_t* e = reinterpret_cast<uint8_t*>(MS_AINFO + modelId * 20);
+    __try {
+        DWORD old;
+        VirtualProtect(e, 20, PAGE_EXECUTE_READWRITE, &old);
+        *reinterpret_cast<uint32_t*>(e + 8)  = cdPosn;
+        *reinterpret_cast<uint32_t*>(e + 12) = cdSize;
+        VirtualProtect(e, 20, old, &old);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static void removeModelSafe(int modelId) {
+    typedef void (__cdecl* fn_RM)(int);
+    fn_RM rm = reinterpret_cast<fn_RM>(0x4089A0);
+    __try { rm(modelId); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Parchea gta3.img: appenda el DFF y actualiza la entrada de directorio
+// cuyo campo offset == origCdPosn. Devuelve el nuevo sector o false si falla.
+static bool patchImg(const std::string& imgPath, const std::string& filePath,
+                     uint32_t origCdPosn, uint32_t& outPosn, uint32_t& outSize) {
+    // Leer el archivo custom (DFF o TXD)
+    HANDLE hSrc = CreateFileA(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hSrc == INVALID_HANDLE_VALUE) {
+        logMsg("[cv_client] No encontrado: %s", filePath.c_str());
+        return false;
+    }
+    DWORD srcSize = GetFileSize(hSrc, nullptr);
+    std::vector<uint8_t> srcData(srcSize);
+    DWORD br = 0; ReadFile(hSrc, srcData.data(), srcSize, &br, nullptr);
+    CloseHandle(hSrc);
+
+    // Abrir gta3.img compartido (GTA SA lo tiene abierto para lectura)
+    HANDLE hImg = CreateFileA(imgPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hImg == INVALID_HANDLE_VALUE) {
+        logMsg("[cv_client] No se puede abrir %s para escritura", imgPath.c_str());
+        return false;
+    }
+
+    DWORD imgBytes = GetFileSize(hImg, nullptr);
+    outPosn = imgBytes / SECTOR_SZ;           // append al final
+    outSize = (srcSize + SECTOR_SZ - 1) / SECTOR_SZ;
+
+    // Escribir DFF/TXD con padding al final del IMG
+    std::vector<uint8_t> padded(outSize * SECTOR_SZ, 0);
+    std::copy(srcData.begin(), srcData.end(), padded.begin());
+    SetFilePointer(hImg, 0, nullptr, FILE_END);
+    DWORD bw = 0; WriteFile(hImg, padded.data(), (DWORD)padded.size(), &bw, nullptr);
+
+    // Buscar la entrada del directorio con offset == origCdPosn y actualizarla
+    SetFilePointer(hImg, 0, nullptr, FILE_BEGIN);
+    uint8_t hdr[8]; ReadFile(hImg, hdr, 8, &br, nullptr);
+    uint32_t numEntries = *(uint32_t*)(hdr + 4);
+    bool found = false;
+    for (uint32_t i = 0; i < numEntries && !found; i++) {
+        uint8_t ent[32]; ReadFile(hImg, ent, 32, &br, nullptr);
+        if (*(uint32_t*)ent == origCdPosn) {
+            char name[25] = {}; memcpy(name, ent + 8, 24);
+            *(uint32_t*)ent     = outPosn;
+            *(uint16_t*)(ent+4) = (uint16_t)outSize;
+            *(uint16_t*)(ent+6) = (uint16_t)outSize;
+            LARGE_INTEGER seekPos; seekPos.QuadPart = 8LL + i * 32;
+            SetFilePointerEx(hImg, seekPos, nullptr, FILE_BEGIN);
+            WriteFile(hImg, ent, 32, &bw, nullptr);
+            logMsg("[cv_client] gta3.img: '%s' sector %u->%u (size %u)",
+                   name, origCdPosn, outPosn, outSize);
+            found = true;
+        }
+    }
+    CloseHandle(hImg);
+    if (!found) logMsg("[cv_client] Entrada con offset=%u no encontrada en directorio", origCdPosn);
+    return found;
+}
+
+// Devuelve la ruta del DFF para un modelId leyendo custom_vehicles.ini
+static std::string getDffForModel(int modelId) {
+    std::string cfgPath = getGameDir() + "\\custom_vehicles.ini";
+    std::ifstream f(cfgPath);
+    if (!f.is_open()) return "";
+    std::string line; bool in = false;
+    auto trim = [](std::string& s) {
+        while (!s.empty() && (s.back()==' '||s.back()=='\t'||s.back()=='\r'||s.back()=='\n')) s.pop_back();
+    };
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0]==';'||line[0]=='#') continue;
+        if (line == "[custom_vehicles]") { in = true; continue; }
+        if (line[0]=='[') { in = false; continue; }
+        if (!in) continue;
+        auto eq = line.find('='), cm = line.find(',');
+        if (eq==std::string::npos || cm==std::string::npos) continue;
+        if (std::stoi(line.substr(0,eq)) != modelId) continue;
+        std::string dff = line.substr(eq+1, cm-eq-1); trim(dff);
+        return getGameDir() + "\\" + dff;
+    }
+    return "";
+}
+
+// Aplica todos los reemplazos del ini dinamicamente
+static void applyAllModelPatches() {
+    std::string gameDir = getGameDir();
+    std::string cfgPath = gameDir + "\\custom_vehicles.ini";
+    std::ifstream f(cfgPath);
+    if (!f.is_open()) { logMsg("[cv_client] custom_vehicles.ini no encontrado"); return; }
+
+    auto patchState = loadPatchState();
+    bool changed = false;
+    std::string imgPath = gameDir + "\\models\\gta3.img";
+
+    std::string line; bool inSect = false;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+        if (line == "[custom_vehicles]") { inSect = true; continue; }
+        if (line[0] == '[') { inSect = false; continue; }
+        if (!inSect) continue;
+
+        auto eq = line.find('='), cm = line.find(',');
+        if (eq == std::string::npos || cm == std::string::npos) continue;
+
+        int modelId = std::stoi(line.substr(0, eq));
+        auto trim = [](std::string& s) {
+            while (!s.empty() && (s.back()==' '||s.back()=='\t'||s.back()=='\r'||s.back()=='\n')) s.pop_back();
+            while (!s.empty() && (s.front()==' '||s.front()=='\t')) s.erase(s.begin());
+        };
+        std::string dffRel = line.substr(eq+1, cm-eq-1);
+        std::string txdRel = line.substr(cm+1);
+        trim(dffRel); trim(txdRel);
+        std::string dffPath = gameDir + "\\" + dffRel;
+        std::string txdPath = gameDir + "\\" + txdRel;
+
+        logMsg("[cv_client] === Modelo %d ===", modelId);
+
+        PatchEntry patch;
+        if (patchState.count(modelId)) {
+            patch = patchState[modelId];
+            logMsg("[cv_client] Modelo %d: patch existente sector=%u size=%u",
+                   modelId, patch.cdPosn, patch.cdSize);
+        } else {
+            // Primera vez: necesitamos parchear gta3.img
+            uint32_t origCdPosn = 0, origCdSize = 0;
+            if (!readStreamingEntry(modelId, &origCdPosn, &origCdSize)) {
+                logMsg("[cv_client] Modelo %d: error leyendo streaming", modelId); continue;
+            }
+            logMsg("[cv_client] Modelo %d: cdPosn original=%u", modelId, origCdPosn);
+
+            if (!patchImg(imgPath, dffPath, origCdPosn, patch.cdPosn, patch.cdSize)) {
+                logMsg("[cv_client] Modelo %d: fallo al parchear DFF", modelId); continue;
+            }
+            patchState[modelId] = patch;
+            changed = true;
+
+            // Intentar tambien parchear el TXD si existe
+            if (GetFileAttributesA(txdPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                // Buscar la TXD entry: buscar offset cercano al DFF original
+                // (La TXD del mismo vehiculo suele estar pocos sectores despues)
+                // Por ahora se puede hacer como mejora futura
+                logMsg("[cv_client] TXD: %s (parcheo de TXD en proxima version)", txdPath.c_str());
+            }
+        }
+
+        // Actualizar streaming table en memoria
+        if (!updateStreamingEntry(modelId, patch.cdPosn, patch.cdSize)) {
+            logMsg("[cv_client] Modelo %d: error actualizando streaming", modelId); continue;
+        }
+
+        removeModelSafe(modelId);
+
+        logMsg("[cv_client] Modelo %d OK: sector=%u size=%u", modelId, patch.cdPosn, patch.cdSize);
+    }
+
+    if (changed) { savePatchState(patchState); logMsg("[cv_client] Patch state guardado"); }
+}
+
+// FASE 1: parchea gta3.img en DllMain (antes de que GTA SA lo abra)
+void ModelLoader::earlyPatch() {
+    auto origInfo  = loadOrigInfo();
+    auto patchState = loadPatchState();
+    if (origInfo.empty()) return; // nada que hacer en la primera ejecucion
+
+    std::string gameDir = getGameDir();
+    std::string imgPath = gameDir + "\\models\\gta3.img";
+    bool changed = false;
+
+    for (auto& kv : origInfo) {
+        int modelId = kv.first;
+        uint32_t origCdPosn = kv.second;
+        if (patchState.count(modelId)) continue; // ya parcheado
+
+        std::string dffPath = getDffForModel(modelId);
+        if (dffPath.empty()) continue;
+
+        PatchEntry patch;
+        if (patchImg(imgPath, dffPath, origCdPosn, patch.cdPosn, patch.cdSize)) {
+            patchState[modelId] = patch;
+            changed = true;
+            OutputDebugStringA(("[cv] earlyPatch: modelo " + std::to_string(modelId) +
+                                " parcheado sector=" + std::to_string(patch.cdPosn) + "\n").c_str());
+        }
+    }
+    if (changed) savePatchState(patchState);
+}
+
+// FASE 2: despues del streaming, guarda origCdPosn y actualiza tabla en memoria
 void ModelLoader::init() {
     logMsg("[cv_client] Inicializando ModelLoader");
 
-    loadConfig();
+    auto origInfo   = loadOrigInfo();
+    auto patchState = loadPatchState();
+    bool origChanged = false;
+
+    std::string gameDir = getGameDir();
+    std::string cfgPath = gameDir + "\\custom_vehicles.ini";
+    std::ifstream f(cfgPath);
+    if (f.is_open()) {
+        std::string line; bool in = false;
+        auto trim = [](std::string& s) {
+            while (!s.empty() && (s.back()==' '||s.back()=='\t'||s.back()=='\r'||s.back()=='\n')) s.pop_back();
+        };
+        while (std::getline(f, line)) {
+            if (line.empty() || line[0]==';'||line[0]=='#') continue;
+            if (line=="[custom_vehicles]") { in=true; continue; }
+            if (line[0]=='[') { in=false; continue; }
+            if (!in) continue;
+            auto eq=line.find('='), cm=line.find(',');
+            if (eq==std::string::npos||cm==std::string::npos) continue;
+            int modelId = std::stoi(line.substr(0,eq));
+            logMsg("[cv_client] === Modelo %d ===", modelId);
+
+            // Si no tenemos el origCdPosn, leerlo del streaming
+            if (!origInfo.count(modelId)) {
+                uint32_t orig=0, sz=0;
+                if (readStreamingEntry(modelId, &orig, &sz)) {
+                    origInfo[modelId] = orig;
+                    origChanged = true;
+                    logMsg("[cv_client] Modelo %d: origCdPosn=%u guardado (proximo arranque parchea)", modelId, orig);
+                }
+                // Sin patch state aun, no podemos actualizar streaming
+                continue;
+            }
+
+            // Actualizar streaming table en memoria si tenemos el nuevo sector
+            if (patchState.count(modelId)) {
+                auto& p = patchState[modelId];
+                if (updateStreamingEntry(modelId, p.cdPosn, p.cdSize)) {
+                    removeModelSafe(modelId);
+                    logMsg("[cv_client] Modelo %d OK: sector=%u size=%u", modelId, p.cdPosn, p.cdSize);
+                }
+            } else {
+                logMsg("[cv_client] Modelo %d: esperando earlyPatch en proximo arranque", modelId);
+            }
+        }
+    }
+    if (origChanged) saveOrigInfo(origInfo);
     logMsg("[cv_client] ModelLoader listo");
 }
 

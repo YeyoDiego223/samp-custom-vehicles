@@ -61,24 +61,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     g_hwnd = hwnd;
     g_origWndProc = (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)CvWndProc);
 
-    // Actualizar ms_aInfoForModel en memoria para redirigir modelo 479 al Porsche.
-    // CStreamingInfo: 20 bytes — [+8]=cdPosn(4), [+12]=cdSize(4)
-    // El modelo 479 (Stratum) usa "regina.dff" internamente en gta3.img (imgId=2).
-    // Nuestro Porsche DFF fue appendado al gta3.img en sector 459016 (319 sectores).
-    static constexpr uintptr_t MS_AINFO = 0x8E4CC0;
-    uint8_t* entry479 = reinterpret_cast<uint8_t*>(MS_AINFO + 479 * 20);
-    __try {
-        DWORD oldProt;
-        VirtualProtect(entry479, 20, PAGE_EXECUTE_READWRITE, &oldProt);
-        *reinterpret_cast<uint32_t*>(entry479 + 8)  = 459016u;
-        *reinterpret_cast<uint32_t*>(entry479 + 12) = 319u;
-        VirtualProtect(entry479, 20, oldProt, &oldProt);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-    // Descargar modelo cacheado
-    typedef void (__cdecl* fn_RemoveModel)(int);
-    fn_RemoveModel removeModel = reinterpret_cast<fn_RemoveModel>(0x4089A0);
-    removeModel(479);
+    // El streaming redirect lo maneja ModelLoader::init() via applyAllModelPatches()
 
     PostMessageA(hwnd, WM_CV_LOAD, 0, 0);
     return 0;
@@ -91,6 +74,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         // intente validar modelos custom (lo cual llama funciones de GTA SA
         // que crashean con ecx=null sin estos patches).
         ModelLoader::applyPatches();
+        ModelLoader::earlyPatch();  // parchea gta3.img antes de que GTA SA lo abra
         CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
     }
     return TRUE;
