@@ -74,7 +74,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         // intente validar modelos custom (lo cual llama funciones de GTA SA
         // que crashean con ecx=null sin estos patches).
         ModelLoader::applyPatches();
-        ModelLoader::earlyPatch();  // parchea gta3.img antes de que GTA SA lo abra
+        ModelLoader::earlyDownload(); // descarga DFFs/TXDs faltantes
+        ModelLoader::earlyPatch();    // parchea gta3.img antes de que GTA SA lo abra
         CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
     }
     return TRUE;

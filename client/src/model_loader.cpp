@@ -1,6 +1,8 @@
 #include "model_loader.hpp"
 #include "gta_sa.hpp"
 #include <windows.h>
+#include <wininet.h>
+#pragma comment(lib, "wininet.lib")
 #include <fstream>
 #include <sstream>
 #include <cstring>
@@ -512,31 +514,135 @@ static bool patchImg(const std::string& imgPath, const std::string& filePath,
     return found;
 }
 
-// Devuelve la ruta del DFF para un modelId leyendo custom_vehicles.ini
-static std::string getDffForModel(int modelId) {
+// ============================================================
+// Descarga automatica de archivos desde URL
+// ============================================================
+
+// Crea los directorios necesarios para una ruta
+static void createDirectories(const std::string& filePath) {
+    std::string dir;
+    for (size_t i = 0; i < filePath.size(); i++) {
+        char c = filePath[i];
+        dir += c;
+        if ((c == '\\' || c == '/') && i > 0)
+            CreateDirectoryA(dir.c_str(), nullptr);
+    }
+}
+
+// Descarga un archivo desde una URL HTTP/HTTPS a disco
+// Devuelve true si la descarga fue exitosa
+static bool downloadFile(const std::string& url, const std::string& localPath) {
+    logMsg("[cv_client] Descargando: %s", url.c_str());
+
+    HINTERNET hNet = InternetOpenA("custom_vehicles_asi/1.0",
+                                    INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    if (!hNet) { logMsg("[cv_client] InternetOpen fallo"); return false; }
+
+    HINTERNET hUrl = InternetOpenUrlA(hNet, url.c_str(), nullptr, 0,
+                                       INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE |
+                                       INTERNET_FLAG_PRAGMA_NOCACHE, 0);
+    if (!hUrl) {
+        logMsg("[cv_client] No se pudo abrir URL: %s (error %lu)", url.c_str(), GetLastError());
+        InternetCloseHandle(hNet); return false;
+    }
+
+    createDirectories(localPath);
+    HANDLE hFile = CreateFileA(localPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        logMsg("[cv_client] No se pudo crear: %s", localPath.c_str());
+        InternetCloseHandle(hUrl); InternetCloseHandle(hNet); return false;
+    }
+
+    char buf[8192]; DWORD read = 0; DWORD total = 0;
+    while (InternetReadFile(hUrl, buf, sizeof(buf), &read) && read > 0) {
+        DWORD written; WriteFile(hFile, buf, read, &written, nullptr);
+        total += read;
+    }
+    CloseHandle(hFile);
+    InternetCloseHandle(hUrl); InternetCloseHandle(hNet);
+
+    logMsg("[cv_client] Descargado: %s (%lu bytes)", localPath.c_str(), total);
+    return total > 0;
+}
+
+// Estructura con toda la info de una entrada del ini
+struct ModelEntry {
+    int         modelId;
+    std::string dffPath, txdPath;
+    std::string dffUrl,  txdUrl;   // opcionales
+};
+
+// Parsea todas las entradas de custom_vehicles.ini
+// Formato: model_id=dff_path,txd_path[,dff_url[,txd_url]]
+static std::vector<ModelEntry> parseConfig() {
+    std::vector<ModelEntry> entries;
     std::string cfgPath = getGameDir() + "\\custom_vehicles.ini";
     std::ifstream f(cfgPath);
-    if (!f.is_open()) return "";
-    std::string line; bool in = false;
+    if (!f.is_open()) return entries;
+
     auto trim = [](std::string& s) {
         while (!s.empty() && (s.back()==' '||s.back()=='\t'||s.back()=='\r'||s.back()=='\n')) s.pop_back();
+        while (!s.empty() && (s.front()==' '||s.front()=='\t')) s.erase(s.begin());
     };
+
+    std::string line; bool in = false;
     while (std::getline(f, line)) {
         if (line.empty() || line[0]==';'||line[0]=='#') continue;
         if (line == "[custom_vehicles]") { in = true; continue; }
         if (line[0]=='[') { in = false; continue; }
         if (!in) continue;
-        auto eq = line.find('='), cm = line.find(',');
-        if (eq==std::string::npos || cm==std::string::npos) continue;
-        if (std::stoi(line.substr(0,eq)) != modelId) continue;
-        std::string dff = line.substr(eq+1, cm-eq-1); trim(dff);
-        return getGameDir() + "\\" + dff;
+
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        // Dividir los campos por coma
+        std::vector<std::string> fields;
+        std::string rest = line.substr(eq+1);
+        std::stringstream ss(rest);
+        std::string field;
+        while (std::getline(ss, field, ',')) { trim(field); fields.push_back(field); }
+
+        if (fields.size() < 2) continue;
+
+        ModelEntry e;
+        e.modelId = std::stoi(line.substr(0, eq));
+        e.dffPath = getGameDir() + "\\" + fields[0];
+        e.txdPath = getGameDir() + "\\" + fields[1];
+        if (fields.size() > 2) e.dffUrl = fields[2];
+        if (fields.size() > 3) e.txdUrl = fields[3];
+        entries.push_back(e);
     }
+    return entries;
+}
+
+// FASE 0: descarga archivos faltantes desde URLs configuradas
+void ModelLoader::earlyDownload() {
+    auto entries = parseConfig();
+    for (auto& e : entries) {
+        bool dffExists = (GetFileAttributesA(e.dffPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+        bool txdExists = (GetFileAttributesA(e.txdPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+        if (!dffExists && !e.dffUrl.empty()) {
+            if (!downloadFile(e.dffUrl, e.dffPath))
+                logMsg("[cv_client] Fallo descarga DFF modelo %d", e.modelId);
+        }
+        if (!txdExists && !e.txdUrl.empty()) {
+            if (!downloadFile(e.txdUrl, e.txdPath))
+                logMsg("[cv_client] Fallo descarga TXD modelo %d", e.modelId);
+        }
+    }
+}
+
+// Devuelve la ruta del DFF para un modelId
+static std::string getDffForModel(int modelId) {
+    for (auto& e : parseConfig())
+        if (e.modelId == modelId) return e.dffPath;
     return "";
 }
 
-// Aplica todos los reemplazos del ini dinamicamente
-static void applyAllModelPatches() {
+// (funcion eliminada - logica en earlyPatch + init)
+static void _unused() {
     std::string gameDir = getGameDir();
     std::string cfgPath = gameDir + "\\custom_vehicles.ini";
     std::ifstream f(cfgPath);
@@ -607,8 +713,7 @@ static void applyAllModelPatches() {
         logMsg("[cv_client] Modelo %d OK: sector=%u size=%u", modelId, patch.cdPosn, patch.cdSize);
     }
 
-    if (changed) { savePatchState(patchState); logMsg("[cv_client] Patch state guardado"); }
-}
+} // _unused
 
 // FASE 1: parchea gta3.img en DllMain (antes de que GTA SA lo abra)
 void ModelLoader::earlyPatch() {
@@ -643,52 +748,35 @@ void ModelLoader::earlyPatch() {
 void ModelLoader::init() {
     logMsg("[cv_client] Inicializando ModelLoader");
 
+    auto entries    = parseConfig();
     auto origInfo   = loadOrigInfo();
     auto patchState = loadPatchState();
     bool origChanged = false;
 
-    std::string gameDir = getGameDir();
-    std::string cfgPath = gameDir + "\\custom_vehicles.ini";
-    std::ifstream f(cfgPath);
-    if (f.is_open()) {
-        std::string line; bool in = false;
-        auto trim = [](std::string& s) {
-            while (!s.empty() && (s.back()==' '||s.back()=='\t'||s.back()=='\r'||s.back()=='\n')) s.pop_back();
-        };
-        while (std::getline(f, line)) {
-            if (line.empty() || line[0]==';'||line[0]=='#') continue;
-            if (line=="[custom_vehicles]") { in=true; continue; }
-            if (line[0]=='[') { in=false; continue; }
-            if (!in) continue;
-            auto eq=line.find('='), cm=line.find(',');
-            if (eq==std::string::npos||cm==std::string::npos) continue;
-            int modelId = std::stoi(line.substr(0,eq));
-            logMsg("[cv_client] === Modelo %d ===", modelId);
+    for (auto& e : entries) {
+        logMsg("[cv_client] === Modelo %d ===", e.modelId);
 
-            // Si no tenemos el origCdPosn, leerlo del streaming
-            if (!origInfo.count(modelId)) {
-                uint32_t orig=0, sz=0;
-                if (readStreamingEntry(modelId, &orig, &sz)) {
-                    origInfo[modelId] = orig;
-                    origChanged = true;
-                    logMsg("[cv_client] Modelo %d: origCdPosn=%u guardado (proximo arranque parchea)", modelId, orig);
-                }
-                // Sin patch state aun, no podemos actualizar streaming
-                continue;
+        if (!origInfo.count(e.modelId)) {
+            uint32_t orig=0, sz=0;
+            if (readStreamingEntry(e.modelId, &orig, &sz)) {
+                origInfo[e.modelId] = orig;
+                origChanged = true;
+                logMsg("[cv_client] Modelo %d: origCdPosn=%u guardado (proximo arranque parchea)", e.modelId, orig);
             }
+            continue; // sin patch state aun
+        }
 
-            // Actualizar streaming table en memoria si tenemos el nuevo sector
-            if (patchState.count(modelId)) {
-                auto& p = patchState[modelId];
-                if (updateStreamingEntry(modelId, p.cdPosn, p.cdSize)) {
-                    removeModelSafe(modelId);
-                    logMsg("[cv_client] Modelo %d OK: sector=%u size=%u", modelId, p.cdPosn, p.cdSize);
-                }
-            } else {
-                logMsg("[cv_client] Modelo %d: esperando earlyPatch en proximo arranque", modelId);
+        if (patchState.count(e.modelId)) {
+            auto& p = patchState[e.modelId];
+            if (updateStreamingEntry(e.modelId, p.cdPosn, p.cdSize)) {
+                removeModelSafe(e.modelId);
+                logMsg("[cv_client] Modelo %d OK: sector=%u size=%u", e.modelId, p.cdPosn, p.cdSize);
             }
+        } else {
+            logMsg("[cv_client] Modelo %d: esperando earlyPatch en proximo arranque", e.modelId);
         }
     }
+
     if (origChanged) saveOrigInfo(origInfo);
     logMsg("[cv_client] ModelLoader listo");
 }

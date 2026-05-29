@@ -5,6 +5,9 @@ namespace ModelLoader {
 
 // Registra todos los modelos definidos en custom_vehicles.ini.
 // Llamar solo despues de que GTA SA haya inicializado su sistema de modelos.
+// Fase 0 (DllMain): descarga DFFs/TXDs faltantes desde las URLs del ini.
+void earlyDownload();
+
 // Fase 1 (DllMain, antes de que GTA SA abra gta3.img):
 // lee cv_orig.ini y parchea gta3.img si hay info de streaming guardada.
 void earlyPatch();
