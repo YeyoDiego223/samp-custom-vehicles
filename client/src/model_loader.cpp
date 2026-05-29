@@ -356,6 +356,7 @@ bool ModelLoader::registerModel(int modelId, const std::string& dffPath, const s
 
 void ModelLoader::init() {
     logMsg("[cv_client] Inicializando ModelLoader");
+
     loadConfig();
     logMsg("[cv_client] ModelLoader listo");
 }
